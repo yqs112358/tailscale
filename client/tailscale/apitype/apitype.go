@@ -30,9 +30,16 @@ type FileTarget struct {
 	PeerAPIURL string
 }
 
+// WaitingFiles represent taildrop files sent to the node, ready to be
+// copied to their permenant location by the client.  The client may
+// opt to handle these these using either the /files GET and DELETE
+// endpoints or by moving the file if the client has read/write
+// access to the AbsolutePath.  The client is responsible for removing
+// the file when they have finished processing it.
 type WaitingFile struct {
-	Name string
-	Size int64
+	Name         string
+	Size         int64
+	AbsolutePath string
 }
 
 // SetPushDeviceTokenRequest is the body POSTed to the LocalAPI endpoint /set-device-token.

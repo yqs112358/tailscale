@@ -80,8 +80,9 @@ func (m *Manager) WaitingFiles() (ret []apitype.WaitingFile, err error) {
 				return true
 			}
 			ret = append(ret, apitype.WaitingFile{
-				Name: filepath.Base(name),
-				Size: fi.Size(),
+				AbsolutePath: filepath.Join(m.opts.Dir, name),
+				Name:         filepath.Base(name),
+				Size:         fi.Size(),
 			})
 		}
 		return true
