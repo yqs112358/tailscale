@@ -1230,7 +1230,7 @@ func (h *Handler) serveWatchIPNBus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	ctx := r.Context()
 	enc := json.NewEncoder(w)
-	h.b.WatchNotifications(ctx, mask, f.Flush, func(roNotify *ipn.Notify) (keepGoing bool) {
+	h.b.WatchNotificationsAs(ctx, mask, f.Flush, func(roNotify *ipn.Notify) (keepGoing bool) {
 		err := enc.Encode(roNotify)
 		if err != nil {
 			h.logf("json.Encode: %v", err)
@@ -1238,7 +1238,7 @@ func (h *Handler) serveWatchIPNBus(w http.ResponseWriter, r *http.Request) {
 		}
 		f.Flush()
 		return true
-	})
+	}, h.Actor)
 }
 
 func (h *Handler) serveLoginInteractive(w http.ResponseWriter, r *http.Request) {
@@ -1250,7 +1250,7 @@ func (h *Handler) serveLoginInteractive(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "want POST", http.StatusBadRequest)
 		return
 	}
-	h.b.StartLoginInteractive(r.Context())
+	h.b.StartLoginInteractiveAs(r.Context(), h.Actor)
 	w.WriteHeader(http.StatusNoContent)
 	return
 }

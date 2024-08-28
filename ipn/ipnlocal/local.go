@@ -156,11 +156,13 @@ func RegisterNewSSHServer(fn newSSHServerFunc) {
 	newSSHServer = fn
 }
 
-// watchSession represents a WatchNotifications channel
+// watchSession represents a WatchNotifications channel,
+// an [ipnauth.Actor] that opened the session
 // and sessionID as required to close targeted buses.
 type watchSession struct {
 	ch        chan *ipn.Notify
-	sessionID string
+	actor     ipnauth.Actor
+	sessionID string // ID of the watchSession; not to be confused with an [ipnauth.SessionID]
 	cancel    func() // call to signal that the session must be terminated
 }
 
@@ -266,9 +268,9 @@ type LocalBackend struct {
 	endpoints        []tailcfg.Endpoint
 	blocked          bool
 	keyExpired       bool
-	authURL          string    // non-empty if not Running
-	authURLTime      time.Time // when the authURL was received from the control server
-	interact         bool      // indicates whether a user requested interactive login
+	authURL          string        // non-empty if not Running
+	authURLTime      time.Time     // when the authURL was received from the control server
+	authActor        ipnauth.Actor // an actor who called [LocalBackend.StartLoginInteractive] last, or nil
 	egg              bool
 	prevIfState      *netmon.State
 	peerAPIServer    *peerAPIServer // or nil
@@ -2059,10 +2061,10 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 
 	blid := b.backendLogID.String()
 	b.logf("Backend: logs: be:%v fe:%v", blid, opts.FrontendLogID)
-	b.sendLocked(ipn.Notify{
+	b.sendToLocked(ipn.Notify{
 		BackendLogID: &blid,
 		Prefs:        &prefs,
-	})
+	}, nil)
 
 	if !loggedOut && (b.hasNodeKeyLocked() || confWantRunning) {
 		// If we know that we're either logged in or meant to be
@@ -2592,6 +2594,13 @@ func applyConfigToHostinfo(hi *tailcfg.Hostinfo, c *conffile.Config) {
 // notifications. There is currently (2022-11-22) no mechanism provided to
 // detect when a message has been dropped.
 func (b *LocalBackend) WatchNotifications(ctx context.Context, mask ipn.NotifyWatchOpt, onWatchAdded func(), fn func(roNotify *ipn.Notify) (keepGoing bool)) {
+	b.WatchNotificationsAs(ctx, mask, onWatchAdded, fn, nil)
+}
+
+// WatchNotificationsAs is like WatchNotifications but takes an [ipnauth.Actor]
+// as an additional parameter. If non-nil, the specified callback is invoked
+// only for notifications relevant to this actor.
+func (b *LocalBackend) WatchNotificationsAs(ctx context.Context, mask ipn.NotifyWatchOpt, onWatchAdded func(), fn func(roNotify *ipn.Notify) (keepGoing bool), actor ipnauth.Actor) {
 	ch := make(chan *ipn.Notify, 128)
 
 	sessionID := rands.HexString(16)
@@ -2647,6 +2656,7 @@ func (b *LocalBackend) WatchNotifications(ctx context.Context, mask ipn.NotifyWa
 
 	session := &watchSession{
 		ch:        ch,
+		actor:     actor,
 		sessionID: sessionID,
 		cancel:    cancel,
 	}
@@ -2769,13 +2779,28 @@ func (b *LocalBackend) DebugPickNewDERP() error {
 //
 // b.mu must not be held.
 func (b *LocalBackend) send(n ipn.Notify) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.sendLocked(n)
+	b.sendTo(n, nil)
 }
 
-// sendLocked is like send, but assumes b.mu is already held.
-func (b *LocalBackend) sendLocked(n ipn.Notify) {
+// notificationTarget represents an identifiable notification recipient.
+// In most cases, it is an [ipnauth.Actor] (and may also implement an [ipnauth.Session]).
+type notificationTarget interface {
+	// UserID returns an OS-specific UID of the receiver.
+	UserID() ipn.WindowsUserID
+}
+
+// sendTo is like [LocalBackend.send] but allows specifying a recipient.
+// If the recipient is non-nil, the notification will be delivered
+// only to their [watchSession]s. Otherwise, it will be delivered
+// to all watchSessions.
+func (b *LocalBackend) sendTo(n ipn.Notify, recipient notificationTarget) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.sendToLocked(n, recipient)
+}
+
+// sendToLocked is like [LocalBackend.sendTo], but assumes b.mu is already held.
+func (b *LocalBackend) sendToLocked(n ipn.Notify, recipient notificationTarget) {
 	if n.Prefs != nil {
 		n.Prefs = ptr.To(stripKeysFromPrefs(*n.Prefs))
 	}
@@ -2788,13 +2813,62 @@ func (b *LocalBackend) sendLocked(n ipn.Notify) {
 		n.FilesWaiting = &empty.Message{}
 	}
 
+	if recipient != nil {
+		// If the recipient has an active LocalAPI session watching notifications,
+		// deliver the notification only to that session.
+		if !b.sendWithFilterLocked(n, (*watchSession).isSameSessionAs, recipient) {
+			// Otherwise, deliver the notification to all sessions
+			// associated with the same user as the recipient.
+			b.sendWithFilterLocked(n, (*watchSession).isSameUserAs, recipient)
+		}
+		return
+	}
+
+	// Most notifications should be sent to all [watchSession]s.
+	// As of 2024-08-28, only BrowseToURL notifications for b.authURL
+	// can be sent to specific sessions.
+	b.sendWithFilterLocked(n, nil, nil)
+}
+
+// sendWithFilterLocked delivers n to [watchSession]s for which f(s, t) returns true,
+// and reports whether the notification was delivered to any sessions.
+// A nil f is equivalent to an f that always return true.
+//
+// b.mu must be held.
+func (b *LocalBackend) sendWithFilterLocked(n ipn.Notify, f func(*watchSession, notificationTarget) bool, t notificationTarget) bool {
+	var sent bool
 	for _, sess := range b.notifyWatchers {
-		select {
-		case sess.ch <- &n:
-		default:
-			// Drop the notification if the channel is full.
+		if f == nil || f(sess, t) {
+			select {
+			case sess.ch <- &n:
+				sent = true
+			default:
+				// Drop the notification if the channel is full.
+			}
 		}
 	}
+	return sent
+}
+
+// isSameSessionAs reports whether s belongs to the same LocalAPI session as the target.
+func (s *watchSession) isSameSessionAs(target notificationTarget) bool {
+	if s1, ok := s.actor.(ipnauth.Session); ok {
+		if s2, ok := target.(ipnauth.Session); ok {
+			return s1.SessionID() == s2.SessionID()
+		}
+	}
+	return false
+}
+
+// isSameUserAs reports whether s belongs to the same user as the target.
+func (s *watchSession) isSameUserAs(target notificationTarget) bool {
+	if s.actor == target {
+		return true
+	}
+	if s.actor == nil {
+		return false
+	}
+	return s.actor.UserID() == target.UserID()
 }
 
 func (b *LocalBackend) sendFileNotify() {
@@ -2827,15 +2901,18 @@ func (b *LocalBackend) sendFileNotify() {
 // This method is called when a new authURL is received from the control plane, meaning that either a user
 // has started a new interactive login (e.g., by running `tailscale login` or clicking Login in the GUI),
 // or the control plane was unable to authenticate this node non-interactively (e.g., due to key expiration).
-// b.interact indicates whether an interactive login is in progress.
+// A non-nil b.authActor indicates that an interactive login is in progress and was initiated by the specified actor.
 // If url is "", it is equivalent to calling [LocalBackend.resetAuthURLLocked] with b.mu held.
 func (b *LocalBackend) setAuthURL(url string) {
 	var popBrowser, keyExpired bool
+	var recipient ipnauth.Actor
 
 	b.mu.Lock()
 	switch {
 	case url == "":
 		b.resetAuthURLLocked()
+		b.mu.Unlock()
+		return
 	case b.authURL != url:
 		b.authURL = url
 		b.authURLTime = b.clock.Now()
@@ -2844,26 +2921,27 @@ func (b *LocalBackend) setAuthURL(url string) {
 		popBrowser = true
 	default:
 		// Otherwise, only open it if the user explicitly requests interactive login.
-		popBrowser = b.interact
+		popBrowser = b.authActor != nil
 	}
 	keyExpired = b.keyExpired
+	recipient = b.authActor // or nil
 	// Consume the StartLoginInteractive call, if any, that caused the control
 	// plane to send us this URL.
-	b.interact = false
+	b.authActor = nil
 	b.mu.Unlock()
 
 	if popBrowser {
-		b.popBrowserAuthNow(url, keyExpired)
+		b.popBrowserAuthNow(url, keyExpired, recipient)
 	}
 }
 
-// popBrowserAuthNow shuts down the data plane and sends an auth URL
-// to the connected frontend, if any.
+// popBrowserAuthNow shuts down the data plane and sends the URL to the recipient's
+// [watchSession]s if the recipient is non-nil; otherwise, it sends the URL to all watchSessions.
 // keyExpired is the value of b.keyExpired upon entry and indicates
 // whether the node's key has expired.
 // It must not be called with b.mu held.
-func (b *LocalBackend) popBrowserAuthNow(url string, keyExpired bool) {
-	b.logf("popBrowserAuthNow: url=%v, key-expired=%v, seamless-key-renewal=%v", url != "", keyExpired, b.seamlessRenewalEnabled())
+func (b *LocalBackend) popBrowserAuthNow(url string, keyExpired bool, recipient ipnauth.Actor) {
+	b.logf("popBrowserAuthNow(%q): url=%v, key-expired=%v, seamless-key-renewal=%v", maybeUsernameOf(recipient), url != "", keyExpired, b.seamlessRenewalEnabled())
 
 	// Deconfigure the local network data plane if:
 	// - seamless key renewal is not enabled;
@@ -2872,7 +2950,7 @@ func (b *LocalBackend) popBrowserAuthNow(url string, keyExpired bool) {
 		b.blockEngineUpdates(true)
 		b.stopEngineAndWait()
 	}
-	b.tellClientToBrowseToURL(url)
+	b.tellRecipientToBrowseToURL(url, recipient)
 	if b.State() == ipn.Running {
 		b.enterState(ipn.Starting)
 	}
@@ -2913,8 +2991,15 @@ func (b *LocalBackend) validPopBrowserURL(urlStr string) bool {
 }
 
 func (b *LocalBackend) tellClientToBrowseToURL(url string) {
+	b.tellRecipientToBrowseToURL(url, nil)
+}
+
+// tellRecipientToBrowseToURL is like tellClientToBrowseToURL but allows specifying a recipient.
+// If the recipient is non-nil, the notification will be delivered only to that actor's [watchSession]s.
+// Otherwise, it will be delivered to all active [watchSession]s.
+func (b *LocalBackend) tellRecipientToBrowseToURL(url string, recipient notificationTarget) {
 	if b.validPopBrowserURL(url) {
-		b.send(ipn.Notify{BrowseToURL: &url})
+		b.sendTo(ipn.Notify{BrowseToURL: &url}, recipient)
 	}
 }
 
@@ -3186,6 +3271,15 @@ func (b *LocalBackend) tryLookupUserName(uid string) string {
 // StartLoginInteractive attempts to pick up the in-progress flow where it left
 // off.
 func (b *LocalBackend) StartLoginInteractive(ctx context.Context) error {
+	return b.StartLoginInteractiveAs(ctx, nil)
+}
+
+// StartLoginInteractiveAs is like StartLoginInteractive but takes an [ipnauth.Actor]
+// as an additional parameter. If non-nil, the specified user is expected to complete
+// the interactive login, and therefore will receive the BrowseToURL notification once
+// the control plane sends us one. Otherwise, the notification will be delivered to all
+// active [watchSession]s.
+func (b *LocalBackend) StartLoginInteractiveAs(ctx context.Context, user ipnauth.Actor) error {
 	b.mu.Lock()
 	if b.cc == nil {
 		panic("LocalBackend.assertClient: b.cc == nil")
@@ -3199,17 +3293,17 @@ func (b *LocalBackend) StartLoginInteractive(ctx context.Context) error {
 	hasValidURL := url != "" && timeSinceAuthURLCreated < ((7*24*time.Hour)-(1*time.Hour))
 	if !hasValidURL {
 		// A user wants to log in interactively, but we don't have a valid authURL.
-		// Set a flag to indicate that interactive login is in progress, forcing
-		// a BrowseToURL notification once the authURL becomes available.
-		b.interact = true
+		// Remember the user who initiated the login, so that we can notify them
+		// once the authURL is available.
+		b.authActor = user
 	}
 	cc := b.cc
 	b.mu.Unlock()
 
-	b.logf("StartLoginInteractive: url=%v", hasValidURL)
+	b.logf("StartLoginInteractiveAs(%q): url=%v", maybeUsernameOf(user), hasValidURL)
 
 	if hasValidURL {
-		b.popBrowserAuthNow(url, keyExpired)
+		b.popBrowserAuthNow(url, keyExpired, user)
 	} else {
 		cc.Login(b.loginFlags | controlclient.LoginInteractive)
 	}
@@ -5054,7 +5148,7 @@ func (b *LocalBackend) resetControlClientLocked() controlclient.Client {
 func (b *LocalBackend) resetAuthURLLocked() {
 	b.authURL = ""
 	b.authURLTime = time.Time{}
-	b.interact = false
+	b.authActor = nil
 }
 
 // ResetForClientDisconnect resets the backend for GUI clients running
@@ -7284,4 +7378,14 @@ func (b *LocalBackend) srcIPHasCapForFilter(srcIP netip.Addr, cap tailcfg.NodeCa
 		return false
 	}
 	return n.HasCap(cap)
+}
+
+// maybeUsernameOf returns the actor's username if the actor
+// is non-nil and its username can be resolved.
+func maybeUsernameOf(actor ipnauth.Actor) string {
+	var username string
+	if actor != nil {
+		username, _ = actor.Username()
+	}
+	return username
 }

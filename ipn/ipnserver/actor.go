@@ -31,6 +31,7 @@ type actor struct {
 	logf logger.Logf
 	ci   *ipnauth.ConnIdentity
 
+	sessionID     ipnauth.SessionID
 	isLocalSystem bool // whether the actor is the Windows' Local System identity.
 }
 
@@ -39,7 +40,20 @@ func newActor(logf logger.Logf, c net.Conn) (*actor, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &actor{logf: logf, ci: ci, isLocalSystem: connIsLocalSystem(ci)}, nil
+	var sessionID ipnauth.SessionID
+	if pid := ci.Pid(); pid != 0 {
+		// Treat all interactions with the same client process, if known, as part of the same session.
+		// TODO(nickkhyl): We won't need this on Windows if/when h2c support for the LocalAPI in
+		// tailscale/tailscale#13364 merges, but we can probably keep it for other platforms.
+		// Ultimately, we need either h2c or PID+StartTime (and likely a cache to speed up auth)
+		// for multi-user support. The current implementation is transient and will be discarded
+		// as we progress on tailscale/corp#18342.
+		sessionID = ipnauth.SessionIDFrom(pid)
+	} else {
+		// Otherwise, generate a new unique ID for the session.
+		sessionID = ipnauth.NewSessionID()
+	}
+	return &actor{logf: logf, ci: ci, sessionID: sessionID, isLocalSystem: connIsLocalSystem(ci)}, nil
 }
 
 // IsLocalSystem implements [ipnauth.Actor].
@@ -59,6 +73,11 @@ func (a *actor) UserID() ipn.WindowsUserID {
 
 func (a *actor) pid() int {
 	return a.ci.Pid()
+}
+
+// SessionID implements [ipnauth.Session].
+func (a *actor) SessionID() ipnauth.SessionID {
+	return a.sessionID
 }
 
 // Username implements [ipnauth.Actor].

@@ -4,7 +4,10 @@
 package ipnauth
 
 import (
+	"fmt"
+
 	"tailscale.com/ipn"
+	"tailscale.com/util/rands"
 )
 
 // Actor is any actor using the [ipnlocal.LocalBackend].
@@ -44,4 +47,52 @@ type Actor interface {
 type ActorCloser interface {
 	// Close releases resources associated with the receiver.
 	Close() error
+}
+
+// SessionID is an opaque, comparable value used to identify a logical [Session].
+type SessionID struct {
+	v any
+}
+
+type uniqueID struct {
+	p *byte
+	s string
+}
+
+// NewSessionID returns a new process-unique [SessionID].
+func NewSessionID() SessionID {
+	// We use both a byte pointer and a random hex string out of paranoia that
+	// eventually we may use a SessionID in a context where 64 bits of entropy
+	// of the hex string is not enough. The string is nice for debugging and logging,
+	// but the pointer guarantees uniqueness of the ID within the address space
+	// of a given process.
+	return SessionID{uniqueID{new(byte), rands.HexString(16)}}
+}
+
+// SessionIDFrom returns a new [SessionID] derived from the specified value.
+// SessionIDs derived from equal values are equal.
+func SessionIDFrom[T comparable](v T) SessionID {
+	return SessionID{v}
+}
+
+// String implements [fmt.Stringer].
+func (id SessionID) String() string {
+	if id.v == nil {
+		return "(none)"
+	}
+	return fmt.Sprint(id.v)
+}
+
+func (id uniqueID) String() string {
+	return id.s
+}
+
+// Session is an optional interface that an [Actor] might implement to link a
+// series of related interactions with the LocalAPI by a [SessionID].
+// It doesn't necessarily correspond to the same [net.Conn] or any physical session.
+// For example, all interactions with the same client process, if one is known,
+// could be considered part of the same session.
+type Session interface {
+	// SessionID returns a unique comparable ID associated with the session.
+	SessionID() SessionID
 }
