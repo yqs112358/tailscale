@@ -154,11 +154,14 @@ type Server struct {
 	verifyClientsURL         string
 	verifyClientsURLFailOpen bool
 
-	mu       sync.Mutex
-	closed   bool
-	netConns map[Conn]chan struct{} // chan is closed when conn closes
-	clients  map[key.NodePublic]*clientSet
-	watchers set.Set[*sclient] // mesh peers
+	mu             sync.Mutex
+	closed         bool
+	flow           map[flowKey]*flow
+	flows          []*flow // slice of values of flow map
+	flowCleanIndex int
+	netConns       map[Conn]chan struct{} // chan is closed when conn closes
+	clients        map[key.NodePublic]*clientSet
+	watchers       set.Set[*sclient] // mesh peers
 	// clientsMesh tracks all clients in the cluster, both locally
 	// and to mesh peers.  If the value is nil, that means the
 	// peer is only local (and thus in the clients Map, but not
@@ -341,6 +344,7 @@ func NewServer(privateKey key.NodePrivate, logf logger.Logf) *Server {
 		packetsDroppedType:   metrics.LabelMap{Label: "type"},
 		clients:              map[key.NodePublic]*clientSet{},
 		clientsMesh:          map[key.NodePublic]PacketForwarder{},
+		flow:                 map[flowKey]*flow{},
 		netConns:             map[Conn]chan struct{}{},
 		memSys0:              ms.Sys,
 		watchers:             set.Set[*sclient]{},
@@ -830,6 +834,7 @@ func (s *Server) accept(ctx context.Context, nc Conn, brw *bufio.ReadWriter, rem
 		connectedAt:    s.clock.Now(),
 		sendQueue:      make(chan pkt, perClientSendQueueDepth),
 		discoSendQueue: make(chan pkt, perClientSendQueueDepth),
+		flows:          map[key.NodePublic]flowAndClientSet{},
 		sendPongCh:     make(chan [8]byte, 1),
 		peerGone:       make(chan peerGoneMsg),
 		canMesh:        s.isMeshPeer(clientInfo),
@@ -866,9 +871,21 @@ func (s *Server) debugLogf(format string, v ...any) {
 	}
 }
 
+// onRunLoopDone is called when the run loop is done
+// to clean up.
+//
+// It must only be called from the [slient.run] goroutine.
+func (c *sclient) onRunLoopDone() {
+	for _, peer := range c.flows {
+		peer.f.ref.Add(-1)
+	}
+	c.flows = nil // unnecessary, but for explicitness
+}
+
 // run serves the client until there's an error.
 // If the client hangs up or the server is closed, run returns nil, otherwise run returns an error.
 func (c *sclient) run(ctx context.Context) error {
+	defer c.onRunLoopDone()
 	// Launch sender, but don't return from run until sender goroutine is done.
 	var grp errgroup.Group
 	sendCtx, cancelSender := context.WithCancel(ctx)
@@ -1028,6 +1045,7 @@ func (c *sclient) handleFrameForwardPacket(ft frameType, fl uint32) error {
 	var dst *sclient
 
 	s.mu.Lock()
+	flo := s.getMakeFlowLocked(srcKey, dstKey)
 	if set, ok := s.clients[dstKey]; ok {
 		dstLen = set.Len()
 		dst = set.activeClient.Load()
@@ -1050,7 +1068,7 @@ func (c *sclient) handleFrameForwardPacket(ft frameType, fl uint32) error {
 	return c.sendPkt(dst, pkt{
 		bs:         contents,
 		enqueuedAt: c.s.clock.Now(),
-		src:        srcKey,
+		flow:       flo,
 	})
 }
 
@@ -1063,22 +1081,13 @@ func (c *sclient) handleFrameSendPacket(ft frameType, fl uint32) error {
 		return fmt.Errorf("client %v: recvPacket: %v", c.key, err)
 	}
 
-	var fwd PacketForwarder
-	var dstLen int
-	var dst *sclient
-
-	s.mu.Lock()
-	if set, ok := s.clients[dstKey]; ok {
-		dstLen = set.Len()
-		dst = set.activeClient.Load()
-	}
-	if dst == nil && dstLen < 1 {
-		fwd = s.clientsMesh[dstKey]
-	}
-	s.mu.Unlock()
+	flo, dst, fwd := c.lookupDest(dstKey)
+	flo.noteActivity()
 
 	if dst == nil {
 		if fwd != nil {
+			flo.pktSendRegion.Add(1)
+			flo.byteSendRegion.Add(1)
 			s.packetsForwardedOut.Add(1)
 			err := fwd.ForwardPacket(c.key, dstKey, contents)
 			c.debugLogf("SendPacket for %s, forwarding via %s: %v", dstKey.ShortString(), fwd, err)
@@ -1088,22 +1097,22 @@ func (c *sclient) handleFrameSendPacket(ft frameType, fl uint32) error {
 			}
 			return nil
 		}
+		flo.dropUnknownDest.Add(1)
 		reason := dropReasonUnknownDest
-		if dstLen > 1 {
-			reason = dropReasonDupClient
-		} else {
-			c.requestPeerGoneWriteLimited(dstKey, contents, PeerGoneReasonNotHere)
-		}
+		c.requestPeerGoneWriteLimited(dstKey, contents, PeerGoneReasonNotHere)
 		s.recordDrop(contents, c.key, dstKey, reason)
 		c.debugLogf("SendPacket for %s, dropping with reason=%s", dstKey.ShortString(), reason)
 		return nil
 	}
 	c.debugLogf("SendPacket for %s, sending directly", dstKey.ShortString())
 
+	flo.pktSendLocal.Add(1)
+	flo.byteSendLocal.Add(1)
+
 	p := pkt{
 		bs:         contents,
 		enqueuedAt: c.s.clock.Now(),
-		src:        c.key,
+		flow:       flo,
 	}
 	return c.sendPkt(dst, p)
 }
@@ -1151,6 +1160,7 @@ func (s *Server) recordDrop(packetBytes []byte, srcKey, dstKey key.NodePublic, r
 }
 
 func (c *sclient) sendPkt(dst *sclient, p pkt) error {
+	// TODO(bradfitz): bump metrics on p.flow
 	s := c.s
 	dstKey := dst.key
 
@@ -1511,6 +1521,7 @@ type sclient struct {
 	br          *bufio.Reader
 	connectedAt time.Time
 	preferred   bool
+	flows       map[key.NodePublic]flowAndClientSet // keyed by dest
 
 	// Owned by sendLoop, not thread-safe.
 	sawSrc map[key.NodePublic]set.Handle
@@ -1563,8 +1574,12 @@ type pkt struct {
 	// The memory is owned by pkt.
 	bs []byte
 
-	// src is the who's the sender of the packet.
-	src key.NodePublic
+	// flow is the flow stats from the src to the dest.
+	flow *flow
+}
+
+func (p pkt) src() key.NodePublic {
+	return p.flow.flowKey.Value().src
 }
 
 // peerGoneMsg is a request to write a peerGone frame to an sclient
@@ -1635,14 +1650,13 @@ func (c *sclient) onSendLoopDone() {
 	for {
 		select {
 		case pkt := <-c.sendQueue:
-			c.s.recordDrop(pkt.bs, pkt.src, c.key, dropReasonGoneDisconnected)
+			c.s.recordDrop(pkt.bs, pkt.src(), c.key, dropReasonGoneDisconnected)
 		case pkt := <-c.discoSendQueue:
-			c.s.recordDrop(pkt.bs, pkt.src, c.key, dropReasonGoneDisconnected)
+			c.s.recordDrop(pkt.bs, pkt.src(), c.key, dropReasonGoneDisconnected)
 		default:
 			return
 		}
 	}
-
 }
 
 func (c *sclient) sendLoop(ctx context.Context) error {
@@ -1669,11 +1683,11 @@ func (c *sclient) sendLoop(ctx context.Context) error {
 			werr = c.sendMeshUpdates()
 			continue
 		case msg := <-c.sendQueue:
-			werr = c.sendPacket(msg.src, msg.bs)
+			werr = c.sendPacket(msg.src(), msg.bs)
 			c.recordQueueTime(msg.enqueuedAt)
 			continue
 		case msg := <-c.discoSendQueue:
-			werr = c.sendPacket(msg.src, msg.bs)
+			werr = c.sendPacket(msg.src(), msg.bs)
 			c.recordQueueTime(msg.enqueuedAt)
 			continue
 		case msg := <-c.sendPongCh:
@@ -1700,10 +1714,10 @@ func (c *sclient) sendLoop(ctx context.Context) error {
 			werr = c.sendMeshUpdates()
 			continue
 		case msg := <-c.sendQueue:
-			werr = c.sendPacket(msg.src, msg.bs)
+			werr = c.sendPacket(msg.src(), msg.bs)
 			c.recordQueueTime(msg.enqueuedAt)
 		case msg := <-c.discoSendQueue:
-			werr = c.sendPacket(msg.src, msg.bs)
+			werr = c.sendPacket(msg.src(), msg.bs)
 			c.recordQueueTime(msg.enqueuedAt)
 		case msg := <-c.sendPongCh:
 			werr = c.sendPong(msg)
