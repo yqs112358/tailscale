@@ -26,7 +26,55 @@ repo_root="${BASH_SOURCE%/*}/../.."
 # being invoked from somewhere else.
 cd "$repo_root"
 
-toolchain="$HOME/.cache/tailscale-go"
+# toolchain, set below is the root of the Go toolchain we'll use to build
+# gocross.
+#
+# It's set to either something with a leading slash (if that's what
+# go.toolchain.rev contains, for testing), or otherwise in the common case it'll
+# be "$HOME/.cache/tsgo/GITHASH" where GITHASH is the contents of the
+# go.toolchain.rev file and the git commit of the
+# https://github.com/tailscale/go release artifact to download.
+toolchain=""
+
+read -r REV <go.toolchain.rev
+case "$REV" in
+/*)
+    toolchain="$REV"
+    ;;
+*)
+    toolchain="$HOME/.cache/tsgo/$REV"
+    if [[ ! -f "$toolchain.extracted" ]]; then
+        mkdir -p "$HOME/.cache/tsgo"
+        rm -rf "$toolchain" "$toolchain.extracted"
+
+        echo "# Downloading Go toolchain $REV" >&2
+
+        # This works for linux and darwin, which is sufficient
+        # (we do not build tailscale-go for other targets).
+        HOST_OS=$(uname -s | tr A-Z a-z)
+        HOST_ARCH="$(uname -m)"
+        if [[ "$HOST_ARCH" == "aarch64" ]]; then
+            # Go uses the name "arm64".
+            HOST_ARCH="arm64"
+        elif [[ "$HOST_ARCH" == "x86_64" ]]; then
+            # Go uses the name "amd64".
+            HOST_ARCH="amd64"
+        fi
+        curl -f -L -o "$toolchain.tar.gz" "https://github.com/tailscale/go/releases/download/build-${REV}/${HOST_OS}-${HOST_ARCH}.tar.gz"
+        mkdir -p "$toolchain"
+        (cd "$toolchain" && tar --strip-components=1 -xf "$toolchain.tar.gz")
+        echo "$REV" >"$toolchain.extracted"
+        rm -f "$toolchain.tar.gz"
+
+        # Do some cleanup of old toolchains while we're here.
+        for hash in $(find "$HOME/.cache/tsgo" -type f -maxdepth 1 -name '*.extracted' -mtime 90 -exec basename {} \; | sed 's/.extracted$//'); do
+            echo "# Cleaning up old Go toolchain $hash" >&2
+            rm -rf "$HOME/.cache/tsgo/$hash"
+            rm -rf "$HOME/.cache/tsgo/$hash.extracted"
+        done
+    fi
+    ;;
+esac
 
 if [[ -d "$toolchain" ]]; then
     # A toolchain exists, but is it recent enough to compile gocross? If not,
@@ -44,42 +92,6 @@ if [[ -d "$toolchain" ]]; then
     if [[ -z "$have_go_minor" || "$have_go_minor" -lt "$want_go_minor" ]]; then
         rm -rf "$toolchain" "$toolchain.extracted"
     fi
-fi
-if [[ ! -d "$toolchain" ]]; then
-    mkdir -p "$HOME/.cache"
-
-    # We need any Go toolchain to build gocross, but the toolchain also has to
-    # be reasonably recent because we upgrade eagerly and gocross might not
-    # build with Go N-1. So, if we have no cached tailscale toolchain at all,
-    # fetch the initial one in shell. Once gocross is built, it'll manage
-    # updates.
-    read -r REV <go.toolchain.rev
-
-    case "$REV" in
-    /*)
-        toolchain="$REV"
-        ;;
-    *)
-        # This works for linux and darwin, which is sufficient
-        # (we do not build tailscale-go for other targets).
-        HOST_OS=$(uname -s | tr A-Z a-z)
-        HOST_ARCH="$(uname -m)"
-        if [[ "$HOST_ARCH" == "aarch64" ]]; then
-            # Go uses the name "arm64".
-            HOST_ARCH="arm64"
-        elif [[ "$HOST_ARCH" == "x86_64" ]]; then
-            # Go uses the name "amd64".
-            HOST_ARCH="amd64"
-        fi
-
-        rm -rf "$toolchain" "$toolchain.extracted"
-        curl -f -L -o "$toolchain.tar.gz" "https://github.com/tailscale/go/releases/download/build-${REV}/${HOST_OS}-${HOST_ARCH}.tar.gz"
-        mkdir -p "$toolchain"
-        (cd "$toolchain" && tar --strip-components=1 -xf "$toolchain.tar.gz")
-        echo "$REV" >"$toolchain.extracted"
-        rm -f "$toolchain.tar.gz"
-        ;;
-    esac
 fi
 
 # Binaries run with `gocross run` can reinvoke gocross, resulting in a
