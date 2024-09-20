@@ -574,6 +574,16 @@ func getLocalBackend(ctx context.Context, logf logger.Logf, logID logid.PublicID
 			}
 			return udpConn, nil
 		}
+		dialer.NetstackRawUDP = func(ctx context.Context, ipType uint32) (net.Conn, error) {
+			// Note: don't just return ns.RawContextUDP or we'll return
+			// *gonet.UDPConn(nil) instead of a nil interface which trips up
+			// callers.
+			udpConn, err := ns.RawContextUDP(ctx, ipType)
+			if err != nil {
+				return nil, err
+			}
+			return udpConn, nil
+		}
 	}
 	if socksListener != nil || httpProxyListener != nil {
 		var addrs []string

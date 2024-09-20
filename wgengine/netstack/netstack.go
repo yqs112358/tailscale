@@ -836,6 +836,17 @@ func (ns *Impl) DialContextUDP(ctx context.Context, ipp netip.AddrPort) (*gonet.
 	return gonet.DialUDP(ns.ipstack, nil, remoteAddress, ipType)
 }
 
+// RawContextUDP returns an "unconnected" *gonet.UDPConn
+func (ns *Impl) RawContextUDP(ctx context.Context, ipTypeNum uint32) (*gonet.UDPConn, error) {
+	var ipType tcpip.NetworkProtocolNumber
+	if ipTypeNum == 4 {
+		ipType = ipv4.ProtocolNumber
+	} else {
+		ipType = ipv6.ProtocolNumber
+	}
+	return gonet.DialUDP(ns.ipstack, nil, nil, ipType)
+}
+
 // getInjectInboundBuffsSizes returns packet memory and a sizes slice for usage
 // when calling tstun.Wrapper.InjectInboundPacketBuffer(). These are sized with
 // consideration for MTU and GSO support on ns.linkEP. They should be recycled

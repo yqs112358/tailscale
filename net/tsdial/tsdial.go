@@ -63,6 +63,10 @@ type Dialer struct {
 	// If nil, it's not used.
 	NetstackDialUDP func(context.Context, netip.AddrPort) (net.Conn, error)
 
+	// NetstackRawUDP creates an unconnected UDP Conn using netstack.
+	// If nil, it's not used.
+	NetstackRawUDP func(context.Context, uint32) (net.Conn, error)
+
 	peerClientOnce sync.Once
 	peerClient     *http.Client
 
@@ -402,7 +406,18 @@ func (d *Dialer) SystemDial(ctx context.Context, network, addr string) (net.Conn
 
 // UserDial connects to the provided network address as if a user were
 // initiating the dial. (e.g. from a SOCKS or HTTP outbound proxy)
-func (d *Dialer) UserDial(ctx context.Context, network, addr string) (net.Conn, error) {
+// For udp, addr == "" returns a raw UDPConn without connected
+func (d *Dialer) UserDial(ctx context.Context, network string, addr string) (net.Conn, error) {
+	if addr == "" {
+		if strings.HasPrefix(network, "tcp") {
+			return nil, errors.New("TCP dial must specify destination address")
+		}
+		if network == "udp" || network == "udp4" {
+			return d.NetstackRawUDP(ctx, 4)
+		} else {
+			return d.NetstackRawUDP(ctx, 6)
+		}
+	}
 	ipp, err := d.userDialResolve(ctx, network, addr)
 	if err != nil {
 		return nil, err

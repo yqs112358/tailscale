@@ -144,7 +144,6 @@ type Conn struct {
 	request    *request
 
 	udpClientAddr net.Addr
-	udpTargetConn net.Conn
 }
 
 // Run starts the new connection.
@@ -279,6 +278,27 @@ func (c *Conn) handleUDP() error {
 	}
 	defer clientUDPConn.Close()
 
+	c.logf("Creating UDP send socket...")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// create an unconnected udp conn as sender
+	serverConn, err := c.srv.dial(ctx, "udp", "")
+	if err != nil {
+		res := errorResponse(generalFailure)
+		buf, _ := res.marshal()
+		c.clientConn.Write(buf)
+		return err
+	}
+	// call to Server.dial with "udp" actually returns a *gonet.UDPConn
+	serverUDPConn, ok := serverConn.(net.PacketConn)
+	if !ok {
+		res := errorResponse(generalFailure)
+		buf, _ := res.marshal()
+		c.clientConn.Write(buf)
+		return err
+	}
+	defer serverUDPConn.Close()
+
 	bindAddr, bindPort, err := splitHostPort(clientUDPConn.LocalAddr().String())
 	c.logf("UDP listen socket binded to %v:%v", bindAddr, bindPort)
 	if err != nil {
@@ -300,32 +320,10 @@ func (c *Conn) handleUDP() error {
 	c.clientConn.Write(buf)
 	c.logf("UDP Associate reponse sent back to client.")
 
-	return c.transferUDP(c.clientConn, clientUDPConn)
+	return c.transferUDP(c.clientConn, clientUDPConn, serverUDPConn)
 }
 
-// Generate a Conn of UDP which can send packets into Tailscale network.
-// Tips: We can't create the Conn in advance because we don't know what's the destination.
-// We have to wait for the client's UDP packet to arrive and then dynamically create PacketConns
-// based on the destination address in the packet header.
-func (c *Conn) generateDialedUDPConn(targetAddr *net.UDPAddr) (net.Conn, error) {
-	if c.udpTargetConn != nil {
-		return c.udpTargetConn, nil
-	}
-	c.logf("Creating UDP send socket...")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	// call to Server.dial with "udp" actually returns a *gonet.UDPConn
-	serverUDPConn, err := c.srv.dial(ctx, "udp", targetAddr.String())
-	if err != nil {
-		res := errorResponse(generalFailure)
-		buf, _ := res.marshal()
-		c.clientConn.Write(buf)
-		return nil, err
-	}
-	return serverUDPConn, nil
-}
-
-func (c *Conn) transferUDP(associatedTCP net.Conn, clientConn net.PacketConn) error {
+func (c *Conn) transferUDP(associatedTCP net.Conn, clientConn net.PacketConn, targetConn net.PacketConn) error {
 	c.logf("Start UDP transfering...")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -341,7 +339,7 @@ func (c *Conn) transferUDP(associatedTCP net.Conn, clientConn net.PacketConn) er
 			case <-ctx.Done():
 				return
 			default:
-				err := c.handleUDPRequest(clientConn, buf, readTimeout)
+				err := c.handleUDPRequest(clientConn, targetConn, buf, readTimeout)
 				if err != nil {
 					if isTimeout(err) {
 						continue
@@ -364,7 +362,7 @@ func (c *Conn) transferUDP(associatedTCP net.Conn, clientConn net.PacketConn) er
 			case <-ctx.Done():
 				return
 			default:
-				err := c.handleUDPResponse(clientConn, buf, readTimeout)
+				err := c.handleUDPResponse(clientConn, targetConn, buf, readTimeout)
 				if err != nil {
 					if isTimeout(err) {
 						continue
@@ -390,6 +388,7 @@ func (c *Conn) transferUDP(associatedTCP net.Conn, clientConn net.PacketConn) er
 
 func (c *Conn) handleUDPRequest(
 	clientConn net.PacketConn,
+	targetConn net.PacketConn,
 	buf []byte,
 	readTimeout time.Duration,
 ) error {
@@ -416,12 +415,7 @@ func (c *Conn) handleUDPRequest(
 		c.logf("resolve target addr fail: %v", err)
 	}
 
-	c.udpTargetConn, err = c.generateDialedUDPConn(targetAddr)
-	if err != nil {
-		return fmt.Errorf("create dialed packet conn: %w", err)
-	}
-
-	nn, err := c.udpTargetConn.Write(data)
+	nn, err := targetConn.WriteTo(data, targetAddr)
 	if err != nil {
 		return fmt.Errorf("write to target %s fail: %w", targetAddr, err)
 	}
@@ -439,20 +433,17 @@ func (c *Conn) handleUDPRequest(
 
 func (c *Conn) handleUDPResponse(
 	clientConn net.PacketConn,
+	targetConn net.PacketConn,
 	buf []byte,
 	readTimeout time.Duration,
 ) error {
 	// add a deadline for the read to avoid blocking forever
-	if c.udpTargetConn == nil {
-		time.Sleep(1 * time.Millisecond)
-		return nil
-	}
-	_ = c.udpTargetConn.SetReadDeadline(time.Now().Add(readTimeout))
-	n, err := c.udpTargetConn.Read(buf)
+	_ = targetConn.SetReadDeadline(time.Now().Add(readTimeout))
+	n, addr, err := targetConn.ReadFrom(buf)
 	if err != nil {
 		return fmt.Errorf("read from target: %w", err)
 	}
-	host, port, err := splitHostPort(c.udpTargetConn.RemoteAddr().String())
+	host, port, err := splitHostPort(addr.String())
 	if err != nil {
 		return fmt.Errorf("split host port: %w", err)
 	}
