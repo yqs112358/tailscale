@@ -315,6 +315,7 @@ func (c *Conn) handleUDP() error {
 		buf, _ = res.marshal()
 	}
 	c.clientConn.Write(buf)
+
 	return c.transferUDP(c.clientConn, clientUDPConn, serverUDPConn)
 }
 
@@ -392,7 +393,6 @@ func (c *Conn) handleUDPRequest(
 		return fmt.Errorf("read from client: %w", err)
 	}
 	c.udpClientAddr = addr
-
 	req, data, err := parseUDPRequest(buf[:n])
 	if err != nil {
 		return fmt.Errorf("parse udp request: %w", err)
@@ -429,7 +429,6 @@ func (c *Conn) handleUDPResponse(
 		return fmt.Errorf("split host port: %w", err)
 	}
 
-	c.logf("Client <- Target: response from %v:%v", host, port)
 	hdr := udpRequest{addr: socksAddr{addrType: getAddrType(host), addr: host, port: port}}
 	pkt, err := hdr.marshal()
 	if err != nil {
@@ -444,12 +443,6 @@ func (c *Conn) handleUDPResponse(
 	if nn != len(data) {
 		return fmt.Errorf("write to client: %w", io.ErrShortWrite)
 	}
-
-	host, port, err = splitHostPort(c.udpClientAddr.String())
-	if err != nil {
-		return fmt.Errorf("split host port: %w", err)
-	}
-	c.logf("Client <- Target: response back to %v:%v", host, port)
 	return nil
 }
 
